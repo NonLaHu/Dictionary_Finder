@@ -10,12 +10,14 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QFrame, QLabel, QPushButton,
     QLineEdit, QListWidget, QListWidgetItem, QTextBrowser,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFileDialog,
-    QCheckBox, QSlider
+    QCheckBox, QSlider, QSizePolicy
 )
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
+
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -38,7 +40,6 @@ import ctypes
 import pyautogui
 import random
 
-from PySide6.QtCore import QTimer
 
 user32 = ctypes.windll.user32
 
@@ -55,26 +56,295 @@ def remember_target_window():
 
     if hwnd and hwnd not in (overlay_hwnd, switch_hwnd):
         target_hwnd = hwnd
+        
+import ctypes
+from ctypes import wintypes
+import time
+import random
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = [
+        ("ki", KEYBDINPUT),
+        ("padding", ctypes.c_byte * 32),  # INPUT union size on 64-bit Windows
+    ]
+
+
+class KEYBOARD_INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("u", INPUTUNION),
+    ]
+
+
+user32.SendInput.argtypes = [
+    wintypes.UINT,
+    ctypes.POINTER(KEYBOARD_INPUT),
+    ctypes.c_int,
+]
+user32.SendInput.restype = wintypes.UINT
+
+
+def send_key_event(character, key_up=False):
+    event = KEYBOARD_INPUT()
+    event.type = INPUT_KEYBOARD
+    event.ki = KEYBDINPUT(
+        0,
+        ord(character),
+        KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if key_up else 0),
+        0,
+        0,
+    )
+
+    ctypes.set_last_error(0)
+    sent = user32.SendInput(
+        1,
+        ctypes.byref(event),
+        ctypes.sizeof(KEYBOARD_INPUT),
+    )
+
+    if sent != 1:
+        error = ctypes.get_last_error()
+        raise OSError(
+            f"SendInput failed: sent={sent}, "
+            f"INPUT size={ctypes.sizeof(KEYBOARD_INPUT)}, "
+            f"KEYBDINPUT size={ctypes.sizeof(KEYBDINPUT)}, "
+            f"Windows error={error}"
+        )
+
+
+def sendinput_type(text):
+    for character in text.lower():
+        send_key_event(character)
+        send_key_event(character, key_up=True)
+        time.sleep(random.uniform(0.001, 0.1))
+        
+import ctypes
+import time
+import math
+from ctypes import wintypes
+
+user32 = ctypes.windll.user32
+
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("union", INPUT_UNION),
+    ]
+
+
+def send_mouse_event(x, y, flags):
+    screen_width = user32.GetSystemMetrics(0)
+    screen_height = user32.GetSystemMetrics(1)
+
+    abs_x = round(x * 65535 / max(1, screen_width - 1))
+    abs_y = round(y * 65535 / max(1, screen_height - 1))
+
+    event = INPUT()
+    event.type = INPUT_MOUSE
+    event.union.mi = MOUSEINPUT(
+        abs_x,
+        abs_y,
+        0,
+        flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        0,
+        None,
+    )
+
+    user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
+
+def send_mouse_click(x, y, duration=0.20, steps=35):
+    """Teleport left of target, move horizontally, click mid-movement."""
+
+    # 1. Teleport 80 pixels to the left of the target.
+    start_x = x + 30
+    start_y = y
+
+    send_mouse_event(start_x, start_y, MOUSEEVENTF_MOVE)
+    time.sleep(0.02)
+
+    # 2. Select a random click step between 25 and 30.
+    click_step = random.randint(25, 30)
+
+    # 3. Move horizontally toward the target.
+    for i in range(1, steps + 1):
+        t = i / steps
+        eased = t * t * (3 - 2 * t)
+
+        current_x = round(start_x + (x - start_x) * eased)
+
+        send_mouse_event(current_x, start_y, MOUSEEVENTF_MOVE)
+
+        if i == click_step:
+            send_mouse_event(
+                current_x, start_y, MOUSEEVENTF_LEFTDOWN
+            )
+            time.sleep(0.03)
+            send_mouse_event(
+                current_x, start_y, MOUSEEVENTF_LEFTUP
+            )
+
+        time.sleep(duration / steps)
+
+# A selected dictionary word is queued until the user clicks the target app.
+pending_word = None
+left_mouse_was_down = False
+waiting_for_release = False
 
 
 def type_word_into_target(word):
-    """Focus the application underneath and type the selected word."""
-    global target_hwnd
+    """Queue a word; type it only after the user clicks the target app."""
+    global pending_word, waiting_for_release
 
-    if not target_hwnd or not user32.IsWindow(target_hwnd):
+    pending_word = word.lower()
+    # Ignore the mouse press that selected the word. Wait for it to be
+    # released before accepting the next click as the user's target click.
+    waiting_for_release = True
+
+    if 'overlay' in globals() and hasattr(overlay, 'status_label'):
+        overlay.status_label.setText(
+            f"READY: click the target input to type '{pending_word}'."
+        )
+
+
+def poll_for_target_click():
+    """Detect a real user click outside the overlay and type the queued word."""
+    global pending_word, left_mouse_was_down, waiting_for_release, target_hwnd
+
+    if not WINDOWS or not pending_word:
         return
 
-    user32.SetForegroundWindow(target_hwnd)
+    is_down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)  # VK_LBUTTON
 
-    # Give Windows a moment to switch focus.
-    for character in word.lower():
-        pyautogui.write(character, interval=0)
-        QTimer.singleShot(
-            0,
-            lambda: None
+    if waiting_for_release:
+        if not is_down:
+            waiting_for_release = False
+        left_mouse_was_down = is_down
+        return
+
+    clicked = is_down and not left_mouse_was_down
+    left_mouse_was_down = is_down
+    if not clicked:
+        return
+
+    foreground = user32.GetForegroundWindow()
+    excluded = {
+        globals().get('overlay_hwnd'),
+        globals().get('switch_hwnd'),
+        int(target_point.winId()) if 'target_point' in globals() else None,
+    }
+    if not foreground or foreground in excluded:
+        return
+
+    word = pending_word
+    pending_word = None
+    target_hwnd = foreground
+    # The user's click has already focused the target and placed its caret.
+    # Do not move the mouse, click again, or steal focus.
+    QTimer.singleShot(40, lambda: sendinput_type(word))
+    if 'overlay' in globals() and hasattr(overlay, 'status_label'):
+        overlay.status_label.setText(f"Typed: {word}")
+
+import time
+
+from PySide6.QtCore import Qt, QTimer
+
+
+class TargetPoint(QWidget):
+    """Small draggable marker for the target application's input field."""
+
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowFlags(
+            Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
         )
-        import time
-        time.sleep(random.uniform(0.001, 0.1))
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground
+        )
+
+        self.setFixedSize(42, 42)
+
+        label = QLabel("＋", self)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("""
+            QLabel {
+                color: white;
+                background: rgba(220, 40, 40, 210);
+                border: 2px solid white;
+                border-radius: 21px;
+                font-size: 24px;
+                font-weight: bold;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(label)
+
+        self.drag_offset = None
+        self.show()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_offset = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+
+    def mouseMoveEvent(self, event):
+        if self.drag_offset is not None:
+            self.move(
+                event.globalPosition().toPoint() - self.drag_offset
+            )
+
+    def mouseReleaseEvent(self, event):
+        self.drag_offset = None
+
+    def target_position(self):
+        """Return the center of the marker in screen coordinates."""
+        return self.mapToGlobal(self.rect().center())
 
 # ============================================================
 # DATA
@@ -342,12 +612,17 @@ class DictionaryOverlay(QWidget):
         title = QLabel("dictionary")
         title.setStyleSheet("font-size: 17px; font-weight: bold;")
 
+        self.details_button = QPushButton("details: off")
+        self.details_button.setMaximumWidth(105)
+        self.details_button.clicked.connect(self.toggle_details)
+
         self.opacity_button = QPushButton("opacity")
         self.opacity_button.setMaximumWidth(75)
         self.opacity_button.clicked.connect(self.change_opacity)
 
         header.addWidget(title)
         header.addStretch()
+        header.addWidget(self.details_button)
         header.addWidget(self.opacity_button)
         layout.addLayout(header)
 
@@ -390,27 +665,35 @@ class DictionaryOverlay(QWidget):
         layout.addWidget(self.result_count)
 
         self.results = QListWidget()
-        self.results.setMinimumHeight(160)
-        self.results.setMaximumHeight(270)
+        self.results.setMinimumHeight(380)
+        self.results.setMaximumHeight(600)
+        self.results.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.results.itemClicked.connect(self.select_word)
-        layout.addWidget(self.results)
+        layout.addWidget(self.results, 1)
 
-        # Definition
+        # Details are hidden by default and can be toggled from the header.
+        self.details_visible = False
         self.definition = QTextBrowser()
         self.definition.setOpenExternalLinks(False)
-        self.definition.setMinimumHeight(150)
+        self.definition.setMinimumHeight(180)
+        self.definition.setVisible(False)
         layout.addWidget(self.definition)
 
         # Hotkey instructions
         hint = QLabel(
             "Ctrl+Shift+Space: toggle click-through\n"
+            "Click a result, then click the target input to type it.\n"
             "Drag the header to move the overlay"
         )
         hint.setObjectName("muted")
         layout.addWidget(hint)
 
-        self.resize(510, 690)
-        self.move(80, 80)
+        # Taller overlay gives the word list substantially more room.
+        self.resize(510, 900)
+        self.move(80, 50)
 
         # Keyboard shortcuts work when this window is interactive.
         toggle_shortcut = QShortcut(
@@ -444,6 +727,17 @@ class DictionaryOverlay(QWidget):
     def change_opacity(self):
         current = self.windowOpacity()
         self.setWindowOpacity(0.65 if current > 0.8 else 0.95)
+
+    def toggle_details(self):
+        self.details_visible = not self.details_visible
+        self.definition.setVisible(self.details_visible)
+        self.details_button.setText(
+            "details: on" if self.details_visible else "details: off"
+        )
+
+        # Give the definition panel room when enabled; return to the taller
+        # results-focused layout when disabled.
+        self.resize(510, 1080 if self.details_visible else 900)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -526,7 +820,14 @@ class DictionaryOverlay(QWidget):
                 )
 
         self.definition.setHtml("".join(html))
-        type_word_into_target(word)
+        # Remove the current search prefix before typing.
+        prefix = self.search_input.text().strip().lower()
+        word_to_type = word.lower()
+
+        if prefix and word_to_type.startswith(prefix):
+            word_to_type = word_to_type[len(prefix):]
+
+        type_word_into_target(word_to_type)
 
 # ============================================================
 # ALWAYS-CLICKABLE MODE SWITCH
@@ -569,7 +870,7 @@ class ModeSwitch(QWidget):
         layout.addWidget(self.button)
         self.update_mode()
         self.show()
-        self.move(80, 785)
+        self.move(600, 50)
 
     def update_mode(self):
         if self.overlay.click_through:
@@ -651,6 +952,8 @@ def refresh_results(*args):
 # START
 # ============================================================
 
+
+
 app = QApplication(sys.argv)
 app.setApplicationName("Dictionary Overlay")
 
@@ -670,10 +973,18 @@ target_timer = QTimer()
 target_timer.timeout.connect(remember_target_window)
 target_timer.start(200)
 
+# Wait for the user to click the target application after selecting a word.
+click_timer = QTimer()
+click_timer.timeout.connect(poll_for_target_click)
+click_timer.start(15)
+
+target_point = TargetPoint()
+target_point.move(500, 500)  # Initial screen position; drag it where needed.
+
 auto_load()
 overlay.status_label.setText(
     f"{len(entries):,} words loaded. "
-    "Use the separate mode switch to toggle click-through."
+    "Select a word, then click the target input to type it."
 )
 
 sys.exit(app.exec())
