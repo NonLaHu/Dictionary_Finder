@@ -1,0 +1,543 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dictionary Search</title>
+<style>
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: #101318;
+  color: #f0f2f6;
+}
+main {
+  max-width: 850px;
+  margin: 35px auto;
+  padding: 20px;
+}
+h1 { margin-bottom: 6px; }
+.muted { color: #9ca3af; font-size: 13px; }
+.files {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+  margin: 24px 0;
+}
+.file {
+  padding: 12px;
+  background: #1c222b;
+  border: 1px solid #303947;
+  border-radius: 10px;
+  min-width: 0;
+}
+.file label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 600;
+  font-size: 13px;
+}
+input[type="file"] {
+  width: 100%;
+  font-size: 12px;
+}
+input[type="text"], input:not([type]) {
+  width: 100%;
+  padding: 14px;
+  background: #1c222b;
+  color: white;
+  border: 1px solid #374151;
+  border-radius: 10px;
+  outline: none;
+}
+input:focus { border-color: #818cf8; }
+#search {
+  font-size: 20px;
+  margin-top: 8px;
+}
+.target-row {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.target-row label {
+  display: block;
+  font-size: 12px;
+  color: #a5b4fc;
+  margin-bottom: 6px;
+}
+#endLetters {
+  font-size: 16px;
+  text-transform: lowercase;
+}
+#results {
+  margin-top: 12px;
+  max-height: 55vh;
+  overflow-y: auto;
+  border-radius: 10px;
+}
+.item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 13px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid #29313c;
+  cursor: pointer;
+  text-align: left;
+  font-size: 16px;
+}
+.item:hover, .item.active { background: #283244; }
+.word {
+  overflow-wrap: anywhere;
+}
+mark {
+  color: #a5b4fc;
+  background: transparent;
+  font-weight: 700;
+}
+.meta {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
+}
+.tag {
+  font-size: 11px;
+  padding: 4px 6px;
+  border-radius: 5px;
+  background: #303747;
+  color: #cbd5e1;
+}
+.tag.noun { color: #86efac; background: #14532d55; }
+.tag.target { color: #fcd34d; background: #78350f66; }
+#definition {
+  margin-top: 18px;
+  padding: 20px;
+  background: #1c222b;
+  border-radius: 12px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+#definition h2 { margin-top: 0; }
+.meaning { margin: 12px 0; }
+.pos { color: #86efac; }
+@media(max-width: 480px) {
+  main { margin: 10px auto; padding: 14px; }
+  .target-row { grid-template-columns: 1fr; }
+  .tag { font-size: 10px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <h1>Dictionary Search</h1>
+  <p class="muted">
+    Prefix search · Ending-letter targeting · Ranked results
+  </p>
+
+  <div class="files">
+    <div class="file">
+      <label for="dictionaryFile">dictionary.json</label>
+      <input type="file" id="dictionaryFile" accept=".json">
+    </div>
+    <div class="file">
+      <label for="startingFile">starting_stats.json</label>
+      <input type="file" id="startingFile" accept=".json">
+    </div>
+    <div class="file">
+      <label for="analysisFile">letter_analysis.json</label>
+      <input type="file" id="analysisFile" accept=".json">
+    </div>
+  </div>
+
+  <div class="target-row">
+    <div>
+      <label for="endLetters">END_LETTERS — target endings</label>
+      <input id="endLetters" type="text"
+        placeholder="e.g. x, z, n" autocomplete="off">
+    </div>
+    <div>
+      <label for="search">SEARCH — word prefix</label>
+      <input id="search" type="text"
+        placeholder="Start typing a word..." autocomplete="off"
+        spellcheck="false" disabled>
+    </div>
+  </div>
+
+  <p id="status" class="muted">Load all three JSON files.</p>
+  <p id="count" class="muted"></p>
+  <div id="results"></div>
+  <div id="definition" hidden></div>
+</main>
+
+<script>
+const $ = selector => document.querySelector(selector);
+
+const dictionaryFile = $("#dictionaryFile");
+const startingFile = $("#startingFile");
+const analysisFile = $("#analysisFile");
+const search = $("#search");
+const endLettersInput = $("#endLetters");
+const status = $("#status");
+const count = $("#count");
+const results = $("#results");
+const definition = $("#definition");
+
+const LIMIT = 150;
+
+let entries = [];
+let startingStats = {};
+let letterAnalysis = {};
+let loaded = {
+  dictionary: false,
+  starting: false,
+  analysis: false
+};
+
+let visible = [];
+let activeIndex = -1;
+
+const lower = value => String(value ?? "").toLowerCase();
+
+function isNoun(data) {
+  return (data?.MEANINGS ?? []).some(
+    meaning => lower(meaning?.[0]) === "noun"
+  );
+}
+
+function updateStatus() {
+  const ready = Object.values(loaded).every(Boolean);
+
+  status.textContent = ready
+    ? `${entries.length.toLocaleString()} words loaded. Ready to search.`
+    : `Dictionary: ${loaded.dictionary ? "loaded" : "waiting"} · ` +
+      `Starting stats: ${loaded.starting ? "loaded" : "waiting"} · ` +
+      `Letter analysis: ${loaded.analysis ? "loaded" : "waiting"}`;
+
+  search.disabled = !ready;
+
+  if (ready) render();
+}
+
+async function readJSON(fileInput) {
+  const file = fileInput.files?.[0];
+  if (!file) return null;
+  return JSON.parse(await file.text());
+}
+
+dictionaryFile.addEventListener("change", async () => {
+  try {
+    const data = await readJSON(dictionaryFile);
+    if (!data || Array.isArray(data) || typeof data !== "object") {
+      throw new Error("Expected a JSON object keyed by words.");
+    }
+
+    entries = Object.entries(data).map(([word, data]) => ({
+      word: lower(word.trim()),
+      data,
+      noun: isNoun(data)
+    })).filter(entry => entry.word.length > 0);
+
+    // Prefix searching uses binary search on this sorted array.
+    entries.sort((a, b) =>
+      a.word < b.word ? -1 : a.word > b.word ? 1 : 0
+    );
+
+    loaded.dictionary = true;
+    updateStatus();
+  } catch (error) {
+    loaded.dictionary = false;
+    updateStatus();
+    status.textContent = "Dictionary error: " + error.message;
+  }
+});
+
+startingFile.addEventListener("change", async () => {
+  try {
+    startingStats = await readJSON(startingFile);
+    if (!startingStats || typeof startingStats !== "object") {
+      throw new Error("Invalid starting statistics JSON.");
+    }
+
+    loaded.starting = true;
+    updateStatus();
+  } catch (error) {
+    loaded.starting = false;
+    updateStatus();
+    status.textContent = "Starting stats error: " + error.message;
+  }
+});
+
+analysisFile.addEventListener("change", async () => {
+  try {
+    letterAnalysis = await readJSON(analysisFile);
+    if (!letterAnalysis || typeof letterAnalysis !== "object") {
+      throw new Error("Invalid letter analysis JSON.");
+    }
+
+    loaded.analysis = true;
+    updateStatus();
+  } catch (error) {
+    loaded.analysis = false;
+    updateStatus();
+    status.textContent = "Analysis error: " + error.message;
+  }
+});
+
+// Priority 1: the final letter is in END_LETTERS.
+function matchesTargetEnding(word) {
+  const targets = lower(endLettersInput.value)
+    .replace(/[^a-z]/g, "");
+
+  return targets.length > 0 && targets.includes(word.slice(-1));
+}
+
+// Priority 2: lower starting-letter rank is better.
+function getStartingRank(word) {
+  const letter = word[0];
+  const rank = Number(startingStats[letter]?.rank);
+
+  return Number.isFinite(rank) ? rank : Infinity;
+}
+
+// Priority 3: more dictionary entries beginning with this
+// letter is used as a proxy for letter-group coverage.
+// It is NOT a measurement of actual word familiarity.
+function getCommonness(word) {
+  const letter = word[0];
+  const value = Number(letterAnalysis[letter]?.word_count);
+
+  return Number.isFinite(value) ? value : 0;
+}
+
+function compareEntries(a, b) {
+  // 1. Target endings first
+  const aTarget = matchesTargetEnding(a.word);
+  const bTarget = matchesTargetEnding(b.word);
+
+  if (aTarget !== bTarget) return aTarget ? -1 : 1;
+
+  // 2. Starting-letter rank: lower rank first
+  const rankDiff = getStartingRank(a.word) - getStartingRank(b.word);
+
+  if (rankDiff !== 0) return rankDiff;
+
+  // 3. Letter-analysis commonness proxy: higher first
+  const commonDiff = getCommonness(b.word) - getCommonness(a.word);
+
+  if (commonDiff !== 0) return commonDiff;
+
+  // 4. Nouns first when the preceding priorities are equal
+  if (a.noun !== b.noun) return a.noun ? -1 : 1;
+
+  // 5. Alphabetical tie-breaker
+  return a.word < b.word ? -1 : a.word > b.word ? 1 : 0;
+}
+
+function findPrefixStart(prefix) {
+  let low = 0;
+  let high = entries.length;
+
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+
+    if (entries[mid].word < prefix) low = mid + 1;
+    else high = mid;
+  }
+
+  return low;
+}
+
+function render() {
+  results.replaceChildren();
+  definition.hidden = true;
+  activeIndex = -1;
+  visible = [];
+
+  if (!Object.values(loaded).every(Boolean)) {
+    count.textContent = "";
+    return;
+  }
+
+  const prefix = lower(search.value.trim());
+
+  if (!prefix) {
+    count.textContent = "Type a word prefix to search.";
+    return;
+  }
+
+  // Only scan words beginning with the requested prefix.
+  const start = findPrefixStart(prefix);
+  const matches = [];
+
+  for (let i = start; i < entries.length; i++) {
+    const entry = entries[i];
+
+    if (!entry.word.startsWith(prefix)) break;
+    matches.push(entry);
+  }
+
+  // Apply ranking after finding the matching prefix candidates.
+  matches.sort(compareEntries);
+
+  const total = matches.length;
+  visible = matches.slice(0, LIMIT);
+
+  count.textContent =
+    `${total.toLocaleString()} matches` +
+    (total > LIMIT ? ` · showing first ${LIMIT}` : "");
+
+  const fragment = document.createDocumentFragment();
+
+  visible.forEach((entry, index) => {
+    const button = document.createElement("button");
+    button.className = "item";
+    button.type = "button";
+
+    const word = document.createElement("span");
+    word.className = "word";
+
+    const highlighted = document.createElement("mark");
+    highlighted.textContent = entry.word.slice(0, prefix.length);
+
+    word.append(
+      highlighted,
+      document.createTextNode(entry.word.slice(prefix.length))
+    );
+
+    const meta = document.createElement("span");
+    meta.className = "meta";
+
+    if (matchesTargetEnding(entry.word)) {
+      meta.append(makeTag("target", "target"));
+    }
+
+    if (entry.noun) {
+      meta.append(makeTag("noun", "noun"));
+    }
+
+    const rank = getStartingRank(entry.word);
+    meta.append(makeTag(
+      "",
+      Number.isFinite(rank) ? `rank ${rank}` : "unranked"
+    ));
+
+    button.append(word, meta);
+    button.addEventListener("click", () => selectWord(index));
+    fragment.append(button);
+  });
+
+  results.append(fragment);
+}
+
+function makeTag(className, text) {
+  const tag = document.createElement("span");
+  tag.className = "tag " + className;
+  tag.textContent = text;
+  return tag;
+}
+
+function selectWord(index) {
+  const entry = visible[index];
+  if (!entry) return;
+
+  search.value = entry.word;
+  results.replaceChildren();
+  count.textContent = "";
+  definition.replaceChildren();
+  definition.hidden = false;
+
+  const heading = document.createElement("h2");
+  heading.textContent = entry.word;
+  definition.append(heading);
+
+  const meanings = [...(entry.data.MEANINGS ?? [])];
+
+  // Noun definitions first; preserve order within each part of speech.
+  meanings.sort((a, b) => {
+    const aNoun = lower(a?.[0]) === "noun";
+    const bNoun = lower(b?.[0]) === "noun";
+    return Number(bNoun) - Number(aNoun);
+  });
+
+  if (!meanings.length) {
+    const p = document.createElement("p");
+    p.textContent = "No definitions available.";
+    definition.append(p);
+  }
+
+  meanings.forEach(([partOfSpeech, meaning], index) => {
+    const p = document.createElement("p");
+    p.className = "meaning";
+
+    const pos = document.createElement("strong");
+    pos.className = "pos";
+    pos.textContent = `${index + 1}. (${lower(partOfSpeech)}) `;
+
+    p.append(pos, document.createTextNode(String(meaning ?? "")));
+    definition.append(p);
+  });
+
+  for (const [key, label] of [
+    ["SYNONYMS", "synonyms"],
+    ["ANTONYMS", "antonyms"]
+  ]) {
+    const words = entry.data[key] ?? [];
+    if (!words.length) continue;
+
+    const p = document.createElement("p");
+    const strong = document.createElement("strong");
+    strong.textContent = label + ": ";
+
+    p.append(
+      strong,
+      document.createTextNode(words.map(lower).join(", "))
+    );
+
+    definition.append(p);
+  }
+}
+
+search.addEventListener("input", render);
+endLettersInput.addEventListener("input", render);
+
+search.addEventListener("keydown", event => {
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    activeIndex = Math.min(activeIndex + 1, visible.length - 1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    activeIndex = Math.max(activeIndex - 1, 0);
+  } else if (event.key === "Enter") {
+    selectWord(activeIndex >= 0 ? activeIndex : 0);
+    return;
+  } else if (event.key === "Escape") {
+    search.value = "";
+    render();
+    return;
+  } else {
+    return;
+  }
+
+  results.querySelectorAll(".item").forEach((button, index) => {
+    button.classList.toggle("active", index === activeIndex);
+
+    if (index === activeIndex) {
+      button.scrollIntoView({ block: "nearest" });
+    }
+  });
+});
+</script>
+</body>
+</html>
