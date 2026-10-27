@@ -34,6 +34,7 @@ WINDOWS = sys.platform == "win32"
 # Mouse automation tuning (seconds / pixels). Adjust these if clicks are missed.
 CLICK_DELAY = 0.05          # Pause after moving to a point and after each click.
 KEY_DELAY = 0.02            # Pause between typed characters.
+KEY_HOLD_DELAY = 0.03      # How long each scan-code key stays pressed.
 CIRCLE_STEP_DELAY = 0.01    # Pause between small circular mouse movements.
 CIRCLE_RADIUS_PX = 5        # Radius of the small movement before each click.
 CIRCLE_STEPS = 8            # Number of points in the pre-click circle.
@@ -76,7 +77,10 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_UNICODE = 0x0004
+KEYEVENTF_UNICODE = 0x0004  # Retained for reference; typing uses scan codes below.
+KEYEVENTF_SCANCODE = 0x0008
+MAPVK_VK_TO_VSC = 0
+VK_SHIFT = 0x10
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -92,7 +96,7 @@ class KEYBDINPUT(ctypes.Structure):
 class INPUTUNION(ctypes.Union):
     _fields_ = [
         ("ki", KEYBDINPUT),
-        ("padding", ctypes.c_byte * 32),  # INPUT union size on 64-bit Windows
+        ("padding", ctypes.c_byte * (32 if ctypes.sizeof(ctypes.c_void_p) == 8 else 24)),  # Native INPUT union size
     ]
 
 
@@ -110,63 +114,108 @@ user32.SendInput.argtypes = [
     ctypes.c_int,
 ]
 user32.SendInput.restype = wintypes.UINT
+user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+user32.MapVirtualKeyW.restype = wintypes.UINT
+user32.VkKeyScanW.argtypes = [wintypes.WCHAR]
+user32.VkKeyScanW.restype = ctypes.c_short
 
 
-def send_key_event(character, key_up=False):
+def send_scan_code(scan_code, key_up=False):
+    """Send one keyboard event identified by scan code, not virtual-key code."""
+    flags = KEYEVENTF_SCANCODE
+    if key_up:
+        flags |= KEYEVENTF_KEYUP
+
     event = KEYBOARD_INPUT()
     event.type = INPUT_KEYBOARD
-    event.ki = KEYBDINPUT(
-        0,
-        ord(character),
-        KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if key_up else 0),
-        0,
-        0,
-    )
+    event.ki = KEYBDINPUT(0, scan_code, flags, 0, 0)
 
     ctypes.set_last_error(0)
     sent = user32.SendInput(
         1,
-        ctypes.byref(event),
+        ctypes.cast(ctypes.byref(event), ctypes.c_void_p),
         ctypes.sizeof(KEYBOARD_INPUT),
     )
-
     if sent != 1:
         error = ctypes.get_last_error()
         raise OSError(
-            f"SendInput failed: sent={sent}, "
-            f"INPUT size={ctypes.sizeof(KEYBOARD_INPUT)}, "
-            f"KEYBDINPUT size={ctypes.sizeof(KEYBDINPUT)}, "
-            f"Windows error={error}"
+            f"SendInput scan-code event failed (sent={sent}, error={error}, "
+            f"INPUT size={ctypes.sizeof(KEYBOARD_INPUT)})."
         )
 
 
+def _scan_code_for_vk(vk):
+    """Map a virtual-key value to its hardware-style scan-code representation."""
+    scan_code = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+    if not scan_code:
+        raise ValueError(f"Windows could not map virtual key 0x{vk:02X} to a scan code.")
+    return scan_code & 0xFF
+
+
+# Standard US-QWERTY physical scan codes. These are key positions, not characters.
+# This deliberately avoids VkKeyScanW(), which can return -1 when the active
+# Windows keyboard layout cannot produce an English character.
+US_QWERTY_SCAN_CODES = {
+    "a": 0x1E, "b": 0x30, "c": 0x2E, "d": 0x20, "e": 0x12,
+    "f": 0x21, "g": 0x22, "h": 0x23, "i": 0x17, "j": 0x24,
+    "k": 0x25, "l": 0x26, "m": 0x32, "n": 0x31, "o": 0x18,
+    "p": 0x19, "q": 0x10, "r": 0x13, "s": 0x1F, "t": 0x14,
+    "u": 0x16, "v": 0x2F, "w": 0x11, "x": 0x2D, "y": 0x15,
+    "z": 0x2C,
+    "1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06,
+    "6": 0x07, "7": 0x08, "8": 0x09, "9": 0x0A, "0": 0x0B,
+    "-": 0x0C, "=": 0x0D, "[": 0x1A, "]": 0x1B, "\\": 0x2B,
+    ";": 0x27, "'": 0x28, ",": 0x33, ".": 0x34, "/": 0x35,
+    "`": 0x29, " ": 0x39, "\t": 0x0F,
+}
+US_QWERTY_SHIFTED = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+    "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+    "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\",
+    ":": ";", '"': "'", "<": ",", ">": ".", "?": "/", "~": "`",
+}
+LEFT_SHIFT_SCAN_CODE = 0x2A
+
 def sendinput_type(text):
-    """Type text through Windows Unicode keyboard events."""
+    """Type via standard US-QWERTY scan-code positions.
+
+    Scan codes identify physical key positions. On a non-US active Windows
+    layout, the resulting text may differ, although gameplay controls that
+    respond to key positions can still recognize the intended physical key.
+    Supports letters, digits, space, tab, and common US punctuation.
+    """
     for character in text:
-        # KEYEVENTF_UNICODE expects UTF-16 code units. Handle non-BMP symbols too.
-        codepoint = ord(character)
-        if codepoint <= 0xFFFF:
-            units = [codepoint]
-        else:
-            codepoint -= 0x10000
-            units = [0xD800 + (codepoint >> 10), 0xDC00 + (codepoint & 0x3FF)]
+        needs_shift = character.isalpha() and character.isupper()
+        base_character = character.lower() if character.isalpha() else character
 
-        for unit in units:
-            down = KEYBOARD_INPUT()
-            down.type = INPUT_KEYBOARD
-            down.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, 0)
-            ctypes.set_last_error(0)
-            sent = user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(KEYBOARD_INPUT))
-            if sent != 1:
-                raise OSError(f"SendInput key-down failed (Windows error {ctypes.get_last_error()}).")
+        if character in US_QWERTY_SHIFTED:
+            base_character = US_QWERTY_SHIFTED[character]
+            needs_shift = True
 
-            up = KEYBOARD_INPUT()
-            up.type = INPUT_KEYBOARD
-            up.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
-            ctypes.set_last_error(0)
-            sent = user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(KEYBOARD_INPUT))
-            if sent != 1:
-                raise OSError(f"SendInput key-up failed (Windows error {ctypes.get_last_error()}).")
+        scan_code = US_QWERTY_SCAN_CODES.get(base_character)
+        if scan_code is None:
+            raise ValueError(
+                f"Unsupported character {character!r}. Supported: English letters, "
+                "digits, spaces, tabs, and common US-QWERTY punctuation."
+            )
+
+        shift_down = False
+        key_down = False
+        try:
+            if needs_shift:
+                send_scan_code(LEFT_SHIFT_SCAN_CODE)
+                shift_down = True
+                time.sleep(CIRCLE_STEP_DELAY)
+
+            send_scan_code(scan_code)
+            key_down = True
+            time.sleep(KEY_HOLD_DELAY)
+        finally:
+            # Release the character key before releasing Shift.
+            if key_down:
+                send_scan_code(scan_code, key_up=True)
+            if shift_down:
+                send_scan_code(LEFT_SHIFT_SCAN_CODE, key_up=True)
 
         time.sleep(KEY_DELAY)
 
@@ -369,7 +418,7 @@ def type_word_into_target(word):
         return
 
     if not WINDOWS:
-        set_status_from_worker("SendInput typing is supported on Windows only.")
+        set_status_from_worker("Scan-code typing is supported on Windows only.")
         return
 
     try:
@@ -381,7 +430,7 @@ def type_word_into_target(word):
         set_status_from_worker(f"Could not read target marker position: {exc}")
         return
 
-    set_status_from_worker(f"Preparing to click target and type '{word}'…")
+    set_status_from_worker(f"Preparing to click target and type '{word}' with scan codes…")
 
     def worker():
         global typing_automation_error
@@ -402,8 +451,8 @@ def type_word_into_target(word):
             set_status_from_worker(f"Typed: {word}")
         except Exception as exc:
             typing_automation_error = str(exc)
-            print("SendInput typing failed:", exc)
-            set_status_from_worker(f"SendInput typing failed: {exc}")
+            print("Scan-code typing failed:", exc)
+            set_status_from_worker(f"Scan-code typing failed: {exc}")
         finally:
             # Restore the exact original overlay style and click-through state.
             if old_style is not None and overlay_hwnd:
@@ -802,7 +851,7 @@ class DictionaryOverlay(QWidget):
         hint = QLabel(
             "Ctrl+Shift+Space: toggle click-through\n"
             "Click a result; the app clicks the target marker position automatically.\n"
-            "The target field is clicked automatically; the remaining letters are typed with SendInput.\n"
+            "The target field is clicked automatically; the remaining letters are typed with Windows scan-code events.\n"
             "Drag the header to move the overlay"
         )
         hint.setObjectName("muted")
@@ -1098,7 +1147,7 @@ target_point.move(500, 500)  # Initial screen position; drag it where needed.
 auto_load()
 overlay.status_label.setText(
     f"{len(entries):,} words loaded. "
-    "Select a word. The app clicks left of the target marker, then types the suffix with Windows SendInput."
+    "Select a word. The app clicks left of the target marker, then types the suffix using Windows scan-code events."
 )
 
 sys.exit(app.exec())
