@@ -2,9 +2,12 @@
 import sys
 import json
 import ctypes
+import subprocess
+import os
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QObject, Signal
 from PySide6.QtGui import QFont, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFrame, QLabel, QPushButton,
@@ -28,6 +31,16 @@ FILES = {
 }
 
 WINDOWS = sys.platform == "win32"
+OSK_SHORTCUT = Path(
+    r"C:\Users\User\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Accessibility\On-Screen Keyboard.lnk"
+)
+
+# Mouse automation tuning (seconds / pixels). Adjust these if clicks are missed.
+CLICK_DELAY = 0.5          # Pause after moving to a point and after each click.
+CIRCLE_STEP_DELAY = 0.01    # Pause between small circular mouse movements.
+CIRCLE_RADIUS_PX = 5        # Radius of the small movement before each click.
+CIRCLE_STEPS = 8            # Number of points in the pre-click circle.
+TARGET_OFFSET_X = 30        # Target click is this many pixels left of the marker.
 
 # Windows extended window styles
 GWL_EXSTYLE = -20
@@ -174,11 +187,15 @@ class INPUT(ctypes.Structure):
 
 
 def send_mouse_event(x, y, flags):
-    screen_width = user32.GetSystemMetrics(0)
-    screen_height = user32.GetSystemMetrics(1)
+    # Use the full virtual desktop, so coordinates from pynput calibration also
+    # work when OSK is on a secondary monitor or the desktop origin is negative.
+    virtual_left = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+    virtual_top = user32.GetSystemMetrics(77)    # SM_YVIRTUALSCREEN
+    virtual_width = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+    virtual_height = user32.GetSystemMetrics(79) # SM_CYVIRTUALSCREEN
 
-    abs_x = round(x * 65535 / max(1, screen_width - 1))
-    abs_y = round(y * 65535 / max(1, screen_height - 1))
+    abs_x = round((x - virtual_left) * 65535 / max(1, virtual_width - 1))
+    abs_y = round((y - virtual_top) * 65535 / max(1, virtual_height - 1))
 
     event = INPUT()
     event.type = INPUT_MOUSE
@@ -226,64 +243,158 @@ def send_mouse_click(x, y, duration=0.20, steps=35):
 
         time.sleep(duration / steps)
 
-# A selected dictionary word is queued until the user clicks the target app.
-pending_word = None
-left_mouse_was_down = False
-waiting_for_release = False
+osk_process = None
+osk_automation_error = None
+status_bridge = None
+KEY_COORDINATES_PATH = BASE_DIR / "key.json"
 
+class StatusBridge(QObject):
+    message = Signal(str)
+
+def set_status_from_worker(message):
+    """Safely send a worker-thread status update to the Qt UI thread."""
+    if status_bridge is not None:
+        status_bridge.message.emit(message)
+
+def open_onscreen_keyboard():
+    """Open the configured Windows OSK shortcut, or reuse an open OSK process."""
+    global osk_process
+
+    if not WINDOWS:
+        return False
+
+    # If the OSK window already exists, don't launch a second copy.
+    try:
+        for _hwnd, title, cls in enumerate_top_level_windows():
+            if ("on-screen keyboard" in title.lower()
+                    or "oskmainclass" in cls.lower()
+                    or title.lower() == "osk"):
+                return True
+    except Exception:
+        pass
+
+    try:
+        if OSK_SHORTCUT.exists():
+            os.startfile(str(OSK_SHORTCUT))
+        else:
+            os.startfile("osk.exe")
+        return True
+    except Exception as exc:
+        print("Could not launch OSK:", exc)
+        if 'overlay' in globals() and hasattr(overlay, 'status_label'):
+            overlay.status_label.setText(f"Could not launch OSK: {exc}")
+        return False
+
+def load_osk_key_coordinates():
+    """Load the calibrated letter centers from key.json."""
+    if not KEY_COORDINATES_PATH.is_file():
+        raise FileNotFoundError(
+            f"Missing {KEY_COORDINATES_PATH}. Run calibrate_osk_keys.py first."
+        )
+
+    with KEY_COORDINATES_PATH.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    keys = data.get("keys", data)
+    coordinates = {}
+    for letter in "abcdefghijklmnopqrstuvwxyz":
+        point = keys.get(letter)
+        if not isinstance(point, dict) or "x" not in point or "y" not in point:
+            raise ValueError(f"key.json has no valid coordinate for key {letter.upper()!r}")
+        coordinates[letter] = (int(point["x"]), int(point["y"]))
+    return coordinates
+
+def move_mouse_circle(x, y):
+    """Make a small circular movement around a point, then return to its center."""
+    import math
+
+    for step in range(CIRCLE_STEPS):
+        angle = (2 * math.pi * step) / CIRCLE_STEPS
+        circle_x = round(x + CIRCLE_RADIUS_PX * math.cos(angle))
+        circle_y = round(y + CIRCLE_RADIUS_PX * math.sin(angle))
+        send_mouse_event(circle_x, circle_y, MOUSEEVENTF_MOVE)
+        time.sleep(CIRCLE_STEP_DELAY)
+
+    send_mouse_event(x, y, MOUSEEVENTF_MOVE)
+    time.sleep(CLICK_DELAY)
+
+
+def click_at_position(x, y):
+    """Circle around the click point, then press/release and pause."""
+    move_mouse_circle(x, y)
+    send_mouse_event(x, y, MOUSEEVENTF_LEFTDOWN)
+    time.sleep(CIRCLE_STEP_DELAY)
+    send_mouse_event(x, y, MOUSEEVENTF_LEFTUP)
+    time.sleep(CLICK_DELAY)
+
+
+def click_osk_key(x, y):
+    """Move in a small circle around a calibrated OSK key, then click it."""
+    click_at_position(x, y)
+
+def click_osk_word(word):
+    """Enter text by clicking each calibrated OSK letter in sequence."""
+    coordinates = load_osk_key_coordinates()
+    missing = sorted(set(c for c in word.lower() if c.isalpha()) - set(coordinates))
+    if missing:
+        raise ValueError("No calibrated coordinates for: " + ", ".join(missing))
+
+    for character in word.lower():
+        if character.isspace():
+            continue
+        if not character.isalpha():
+            raise ValueError(
+                f"Unsupported character {character!r}; key.json currently calibrates letters only."
+            )
+        x, y = coordinates[character]
+        click_osk_key(x, y)
+
+def click_target_position():
+    """Click slightly left of the draggable target marker, beneath the overlay."""
+    if 'target_point' not in globals():
+        raise RuntimeError("Target position marker is not initialized.")
+
+    point = target_point.target_position()
+    x = point.x() - TARGET_OFFSET_X
+    y = point.y()
+
+    # Wait for the selection click to be released before taking control.
+    while user32.GetAsyncKeyState(0x01) & 0x8000:
+        time.sleep(CIRCLE_STEP_DELAY)
+    time.sleep(CLICK_DELAY)
+
+    click_at_position(x, y)
 
 def type_word_into_target(word):
-    """Queue a word; type it only after the user clicks the target app."""
-    global pending_word, waiting_for_release
+    """Open OSK, click the target marker's left side, then type by OSK clicks."""
+    if not word:
+        return
 
-    pending_word = word.lower()
-    # Ignore the mouse press that selected the word. Wait for it to be
-    # released before accepting the next click as the user's target click.
-    waiting_for_release = True
+    osk_ok = open_onscreen_keyboard()
+    if not osk_ok:
+        if 'overlay' in globals() and hasattr(overlay, 'status_label'):
+            overlay.status_label.setText(
+                "Could not open OSK. Check the shortcut path and Windows permissions."
+            )
+        return
 
     if 'overlay' in globals() and hasattr(overlay, 'status_label'):
         overlay.status_label.setText(
-            f"READY: click the target input to type '{pending_word}'."
+            f"Preparing to click target and enter '{word.lower()}'…"
         )
 
+    def worker():
+        global osk_automation_error
+        try:
+            click_target_position()
+            click_osk_word(word.lower())
+            set_status_from_worker(f"Entered via OSK mouse clicks: {word.lower()}")
+        except Exception as exc:
+            osk_automation_error = str(exc)
+            print("OSK mouse typing failed:", exc)
+            set_status_from_worker(f"OSK mouse typing failed: {exc}")
 
-def poll_for_target_click():
-    """Detect a real user click outside the overlay and type the queued word."""
-    global pending_word, left_mouse_was_down, waiting_for_release, target_hwnd
-
-    if not WINDOWS or not pending_word:
-        return
-
-    is_down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)  # VK_LBUTTON
-
-    if waiting_for_release:
-        if not is_down:
-            waiting_for_release = False
-        left_mouse_was_down = is_down
-        return
-
-    clicked = is_down and not left_mouse_was_down
-    left_mouse_was_down = is_down
-    if not clicked:
-        return
-
-    foreground = user32.GetForegroundWindow()
-    excluded = {
-        globals().get('overlay_hwnd'),
-        globals().get('switch_hwnd'),
-        int(target_point.winId()) if 'target_point' in globals() else None,
-    }
-    if not foreground or foreground in excluded:
-        return
-
-    word = pending_word
-    pending_word = None
-    target_hwnd = foreground
-    # The user's click has already focused the target and placed its caret.
-    # Do not move the mouse, click again, or steal focus.
-    QTimer.singleShot(40, lambda: sendinput_type(word))
-    if 'overlay' in globals() and hasattr(overlay, 'status_label'):
-        overlay.status_label.setText(f"Typed: {word}")
+    threading.Thread(target=worker, daemon=True).start()
 
 import time
 
@@ -686,6 +797,7 @@ class DictionaryOverlay(QWidget):
         hint = QLabel(
             "Ctrl+Shift+Space: toggle click-through\n"
             "Click a result, then click the target input to type it.\n"
+            "Windows On-Screen Keyboard opens when a word is selected.\n"
             "Drag the header to move the overlay"
         )
         hint.setObjectName("muted")
@@ -958,6 +1070,8 @@ app = QApplication(sys.argv)
 app.setApplicationName("Dictionary Overlay")
 
 overlay = DictionaryOverlay()
+status_bridge = StatusBridge()
+status_bridge.message.connect(overlay.status_label.setText)
 
 # Give the widgets convenient global names for the callbacks.
 ending_input = overlay.ending_input
@@ -973,18 +1087,13 @@ target_timer = QTimer()
 target_timer.timeout.connect(remember_target_window)
 target_timer.start(200)
 
-# Wait for the user to click the target application after selecting a word.
-click_timer = QTimer()
-click_timer.timeout.connect(poll_for_target_click)
-click_timer.start(15)
-
 target_point = TargetPoint()
 target_point.move(500, 500)  # Initial screen position; drag it where needed.
 
 auto_load()
 overlay.status_label.setText(
     f"{len(entries):,} words loaded. "
-    "Select a word, then click the target input to type it."
+    "Select a word. The app clicks 30 px left of the target marker, then enters letters using key.json."
 )
 
 sys.exit(app.exec())

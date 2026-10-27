@@ -2,9 +2,12 @@
 import sys
 import json
 import ctypes
+import subprocess
+import os
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QObject, Signal
 from PySide6.QtGui import QFont, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFrame, QLabel, QPushButton,
@@ -28,6 +31,13 @@ FILES = {
 }
 
 WINDOWS = sys.platform == "win32"
+# Mouse automation tuning (seconds / pixels). Adjust these if clicks are missed.
+CLICK_DELAY = 0.05          # Pause after moving to a point and after each click.
+KEY_DELAY = 0.02            # Pause between typed characters.
+CIRCLE_STEP_DELAY = 0.01    # Pause between small circular mouse movements.
+CIRCLE_RADIUS_PX = 5        # Radius of the small movement before each click.
+CIRCLE_STEPS = 8            # Number of points in the pre-click circle.
+TARGET_OFFSET_X = 30        # Target click is this many pixels left of the marker.
 
 # Windows extended window styles
 GWL_EXSTYLE = -20
@@ -131,10 +141,35 @@ def send_key_event(character, key_up=False):
 
 
 def sendinput_type(text):
-    for character in text.lower():
-        send_key_event(character)
-        send_key_event(character, key_up=True)
-        time.sleep(random.uniform(0.001, 0.1))
+    """Type text through Windows Unicode keyboard events."""
+    for character in text:
+        # KEYEVENTF_UNICODE expects UTF-16 code units. Handle non-BMP symbols too.
+        codepoint = ord(character)
+        if codepoint <= 0xFFFF:
+            units = [codepoint]
+        else:
+            codepoint -= 0x10000
+            units = [0xD800 + (codepoint >> 10), 0xDC00 + (codepoint & 0x3FF)]
+
+        for unit in units:
+            down = KEYBOARD_INPUT()
+            down.type = INPUT_KEYBOARD
+            down.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, 0)
+            ctypes.set_last_error(0)
+            sent = user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(KEYBOARD_INPUT))
+            if sent != 1:
+                raise OSError(f"SendInput key-down failed (Windows error {ctypes.get_last_error()}).")
+
+            up = KEYBOARD_INPUT()
+            up.type = INPUT_KEYBOARD
+            up.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+            ctypes.set_last_error(0)
+            sent = user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(KEYBOARD_INPUT))
+            if sent != 1:
+                raise OSError(f"SendInput key-up failed (Windows error {ctypes.get_last_error()}).")
+
+        time.sleep(KEY_DELAY)
+
         
 import ctypes
 import time
@@ -173,12 +208,37 @@ class INPUT(ctypes.Structure):
     ]
 
 
-def send_mouse_event(x, y, flags):
-    screen_width = user32.GetSystemMetrics(0)
-    screen_height = user32.GetSystemMetrics(1)
+# A generic pointer allows SendInput to accept either mouse or keyboard INPUT structures.
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
 
-    abs_x = round(x * 65535 / max(1, screen_width - 1))
-    abs_y = round(y * 65535 / max(1, screen_height - 1))
+# Pointer-sized window-style functions avoid HWND truncation on 64-bit Windows.
+if ctypes.sizeof(ctypes.c_void_p) == 8:
+    _get_window_long = user32.GetWindowLongPtrW
+    _set_window_long = user32.SetWindowLongPtrW
+else:
+    _get_window_long = user32.GetWindowLongW
+    _set_window_long = user32.SetWindowLongW
+_get_window_long.argtypes = [wintypes.HWND, ctypes.c_int]
+_get_window_long.restype = ctypes.c_ssize_t
+_set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+_set_window_long.restype = ctypes.c_ssize_t
+user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, wintypes.UINT,
+]
+user32.SetWindowPos.restype = wintypes.BOOL
+
+def send_mouse_event(x, y, flags):
+    # Use the full virtual desktop, so coordinates from pynput calibration also
+    # work when OSK is on a secondary monitor or the desktop origin is negative.
+    virtual_left = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+    virtual_top = user32.GetSystemMetrics(77)    # SM_YVIRTUALSCREEN
+    virtual_width = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+    virtual_height = user32.GetSystemMetrics(79) # SM_CYVIRTUALSCREEN
+
+    abs_x = round((x - virtual_left) * 65535 / max(1, virtual_width - 1))
+    abs_y = round((y - virtual_top) * 65535 / max(1, virtual_height - 1))
 
     event = INPUT()
     event.type = INPUT_MOUSE
@@ -191,7 +251,18 @@ def send_mouse_event(x, y, flags):
         None,
     )
 
-    user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
+    ctypes.set_last_error(0)
+    sent = user32.SendInput(
+        1,
+        ctypes.cast(ctypes.byref(event), ctypes.c_void_p),
+        ctypes.sizeof(INPUT),
+    )
+    if sent != 1:
+        error = ctypes.get_last_error()
+        raise OSError(
+            f"Windows rejected mouse input (sent={sent}, error={error}, "
+            f"INPUT size={ctypes.sizeof(INPUT)})."
+        )
 
 def send_mouse_click(x, y, duration=0.20, steps=35):
     """Teleport left of target, move horizontally, click mid-movement."""
@@ -226,64 +297,126 @@ def send_mouse_click(x, y, duration=0.20, steps=35):
 
         time.sleep(duration / steps)
 
-# A selected dictionary word is queued until the user clicks the target app.
-pending_word = None
-left_mouse_was_down = False
-waiting_for_release = False
+osk_process = None
+typing_automation_error = None
+status_bridge = None
+
+class StatusBridge(QObject):
+    message = Signal(str)
+
+def set_status_from_worker(message):
+    """Safely send a worker-thread status update to the Qt UI thread."""
+    if status_bridge is not None:
+        status_bridge.message.emit(message)
+
+def move_mouse_circle(x, y):
+    """Make a small circular movement around a point, then return to its center."""
+    import math
+
+    for step in range(CIRCLE_STEPS):
+        angle = (2 * math.pi * step) / CIRCLE_STEPS
+        circle_x = round(x + CIRCLE_RADIUS_PX * math.cos(angle))
+        circle_y = round(y + CIRCLE_RADIUS_PX * math.sin(angle))
+        send_mouse_event(circle_x, circle_y, MOUSEEVENTF_MOVE)
+        time.sleep(CIRCLE_STEP_DELAY)
+
+    send_mouse_event(x, y, MOUSEEVENTF_MOVE)
+    time.sleep(CLICK_DELAY)
+
+
+def click_at_position(x, y):
+    """Circle around the click point, then press/release and pause."""
+    move_mouse_circle(x, y)
+    send_mouse_event(x, y, MOUSEEVENTF_LEFTDOWN)
+    time.sleep(CIRCLE_STEP_DELAY)
+    send_mouse_event(x, y, MOUSEEVENTF_LEFTUP)
+    time.sleep(CLICK_DELAY)
+
+
+def click_target_position(x, y):
+    """Click the target field at the precomputed screen position."""
+    # The overlay's click-through style is enabled by the caller before this.
+    while user32.GetAsyncKeyState(0x01) & 0x8000:
+        time.sleep(CIRCLE_STEP_DELAY)
+    time.sleep(CLICK_DELAY)
+    click_at_position(x, y)
+
+
+def get_window_exstyle(hwnd):
+    return int(_get_window_long(wintypes.HWND(hwnd), GWL_EXSTYLE))
+
+
+def set_hwnd_click_through(hwnd, enabled):
+    """Set WS_EX_TRANSPARENT directly on a native HWND and refresh hit-testing."""
+    if not hwnd:
+        return
+    style = get_window_exstyle(hwnd)
+    style |= WS_EX_LAYERED
+    if enabled:
+        style |= WS_EX_TRANSPARENT
+    else:
+        style &= ~WS_EX_TRANSPARENT
+    _set_window_long(wintypes.HWND(hwnd), GWL_EXSTYLE, style)
+    user32.SetWindowPos(
+        wintypes.HWND(hwnd), None, 0, 0, 0, 0,
+        0x0001 | 0x0002 | 0x0004 | 0x0010,  # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+    )
 
 
 def type_word_into_target(word):
-    """Queue a word; type it only after the user clicks the target app."""
-    global pending_word, waiting_for_release
-
-    pending_word = word.lower()
-    # Ignore the mouse press that selected the word. Wait for it to be
-    # released before accepting the next click as the user's target click.
-    waiting_for_release = True
-
-    if 'overlay' in globals() and hasattr(overlay, 'status_label'):
-        overlay.status_label.setText(
-            f"READY: click the target input to type '{pending_word}'."
-        )
-
-
-def poll_for_target_click():
-    """Detect a real user click outside the overlay and type the queued word."""
-    global pending_word, left_mouse_was_down, waiting_for_release, target_hwnd
-
-    if not WINDOWS or not pending_word:
+    """Click the target field, then type the selected suffix using SendInput."""
+    if not word:
         return
 
-    is_down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)  # VK_LBUTTON
-
-    if waiting_for_release:
-        if not is_down:
-            waiting_for_release = False
-        left_mouse_was_down = is_down
+    if not WINDOWS:
+        set_status_from_worker("SendInput typing is supported on Windows only.")
         return
 
-    clicked = is_down and not left_mouse_was_down
-    left_mouse_was_down = is_down
-    if not clicked:
+    try:
+        # QWidget methods must be read on the Qt/UI thread, before starting worker.
+        point = target_point.target_position()
+        target_x = point.x() - TARGET_OFFSET_X
+        target_y = point.y()
+    except Exception as exc:
+        set_status_from_worker(f"Could not read target marker position: {exc}")
         return
 
-    foreground = user32.GetForegroundWindow()
-    excluded = {
-        globals().get('overlay_hwnd'),
-        globals().get('switch_hwnd'),
-        int(target_point.winId()) if 'target_point' in globals() else None,
-    }
-    if not foreground or foreground in excluded:
-        return
+    set_status_from_worker(f"Preparing to click target and type '{word}'…")
 
-    word = pending_word
-    pending_word = None
-    target_hwnd = foreground
-    # The user's click has already focused the target and placed its caret.
-    # Do not move the mouse, click again, or steal focus.
-    QTimer.singleShot(40, lambda: sendinput_type(word))
-    if 'overlay' in globals() and hasattr(overlay, 'status_label'):
-        overlay.status_label.setText(f"Typed: {word}")
+    def worker():
+        global typing_automation_error
+        old_style = None
+        try:
+            if not overlay_hwnd:
+                raise RuntimeError("Overlay window handle is not ready.")
+
+            # The target point may be underneath the overlay. Temporarily let
+            # the target click pass through the overlay window.
+            old_style = get_window_exstyle(overlay_hwnd)
+            set_hwnd_click_through(overlay_hwnd, True)
+            time.sleep(CLICK_DELAY)
+
+            click_target_position(target_x, target_y)
+            sendinput_type(word)
+            typing_automation_error = None
+            set_status_from_worker(f"Typed: {word}")
+        except Exception as exc:
+            typing_automation_error = str(exc)
+            print("SendInput typing failed:", exc)
+            set_status_from_worker(f"SendInput typing failed: {exc}")
+        finally:
+            # Restore the exact original overlay style and click-through state.
+            if old_style is not None and overlay_hwnd:
+                try:
+                    _set_window_long(wintypes.HWND(overlay_hwnd), GWL_EXSTYLE, old_style)
+                    user32.SetWindowPos(
+                        wintypes.HWND(overlay_hwnd), None, 0, 0, 0, 0,
+                        0x0001 | 0x0002 | 0x0004 | 0x0010,
+                    )
+                except Exception as restore_exc:
+                    print("Could not restore overlay window style:", restore_exc)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 import time
 
@@ -490,24 +623,7 @@ def sort_key(entry):
 def set_click_through(widget, enabled):
     if not WINDOWS:
         return
-
-    hwnd = int(widget.winId())
-
-    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    style |= WS_EX_LAYERED
-
-    if enabled:
-        style |= WS_EX_TRANSPARENT
-    else:
-        style &= ~WS_EX_TRANSPARENT
-
-    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-
-    # Tell Windows to refresh the extended styles.
-    user32.SetWindowPos(
-        hwnd, 0, 0, 0, 0, 0,
-        0x0001 | 0x0002 | 0x0004 | 0x0010
-    )
+    set_hwnd_click_through(int(widget.winId()), enabled)
 
 # ============================================================
 # OVERLAY WINDOW
@@ -685,7 +801,8 @@ class DictionaryOverlay(QWidget):
         # Hotkey instructions
         hint = QLabel(
             "Ctrl+Shift+Space: toggle click-through\n"
-            "Click a result, then click the target input to type it.\n"
+            "Click a result; the app clicks the target marker position automatically.\n"
+            "The target field is clicked automatically; the remaining letters are typed with SendInput.\n"
             "Drag the header to move the overlay"
         )
         hint.setObjectName("muted")
@@ -958,6 +1075,8 @@ app = QApplication(sys.argv)
 app.setApplicationName("Dictionary Overlay")
 
 overlay = DictionaryOverlay()
+status_bridge = StatusBridge()
+status_bridge.message.connect(overlay.status_label.setText)
 
 # Give the widgets convenient global names for the callbacks.
 ending_input = overlay.ending_input
@@ -973,18 +1092,13 @@ target_timer = QTimer()
 target_timer.timeout.connect(remember_target_window)
 target_timer.start(200)
 
-# Wait for the user to click the target application after selecting a word.
-click_timer = QTimer()
-click_timer.timeout.connect(poll_for_target_click)
-click_timer.start(15)
-
 target_point = TargetPoint()
 target_point.move(500, 500)  # Initial screen position; drag it where needed.
 
 auto_load()
 overlay.status_label.setText(
     f"{len(entries):,} words loaded. "
-    "Select a word, then click the target input to type it."
+    "Select a word. The app clicks left of the target marker, then types the suffix with Windows SendInput."
 )
 
 sys.exit(app.exec())
